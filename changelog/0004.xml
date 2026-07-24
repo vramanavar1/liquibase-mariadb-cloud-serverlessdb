@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+  xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                      http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+  <changeSet id="4" author="VivekRamanavar" runOnChange="true">
+    <comment>usp_GetEmployee: returns EmpId, EmpName, DepartmentName for a given EmpId; all records when NULL is passed.</comment>
+    <sql splitStatements="false">
+      <![CDATA[
+      CREATE OR REPLACE PROCEDURE `usp_GetEmployee` (IN p_EmpId INT)
+      BEGIN
+          SELECT e.`EmpId`,
+                 e.`EmpName`,
+                 d.`DepartmentName`
+          FROM   `Employee` e
+          LEFT JOIN `Department` d
+                 ON d.`DepartmentId` = e.`DepartmentId`
+          WHERE  (p_EmpId IS NULL OR e.`EmpId` = p_EmpId);
+      END
+      ]]>
+    </sql>
+    <rollback>DROP PROCEDURE IF EXISTS `usp_GetEmployee`</rollback>
+  </changeSet>
+</databaseChangeLog>

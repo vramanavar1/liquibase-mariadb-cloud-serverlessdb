@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- =========================================================================
+  Driver manifest for the CI/CD pipeline (NOT an application build).
+
+  The liquibase/liquibase Docker image does not bundle the MariaDB JDBC
+  driver ("Cannot find database driver: org.mariadb.jdbc.Driver" on a bare
+  run). Instead of committing jar binaries to the repo, the pipeline resolves
+  the driver from Maven Central at runtime:
+
+      mvn -B -f drivers-pom.xml dependency:copy-dependencies \
+          -DoutputDirectory=drivers -DincludeScope=runtime
+
+  and mounts the resulting drivers/ folder into the container at
+  /liquibase/lib (see azure-pipelines.yml).
+
+  MariaDB SkySQL uses plain username/password auth over TLS (?sslMode=trust in
+  the URL), so no cloud-IAM companion library is required (unlike the Entra
+  service-principal variant, which additionally needs msal4j).
+
+  To upgrade the driver: bump the version below. Nothing else to change.
+========================================================================== -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>local.pipeline</groupId>
+  <artifactId>liquibase-jdbc-drivers</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+
+  <dependencies>
+    <!-- MariaDB Connector/J JDBC driver -->
+    <dependency>
+      <groupId>org.mariadb.jdbc</groupId>
+      <artifactId>mariadb-java-client</artifactId>
+      <version>3.5.9</version>
+    </dependency>
+  </dependencies>
+</project>

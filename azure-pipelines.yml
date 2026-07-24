@@ -1,0 +1,202 @@
+# =============================================================================
+# Azure DevOps CI/CD pipeline: deploy Liquibase changelogs to MariaDB Cloud
+# (SkySQL serverless).
+#
+# One-time setup required in the Azure DevOps project:
+#
+# 1) Variable group 'liquibase-mariadb' (Pipelines > Library) containing:
+#      DB_HOST                     = <your-server>.db2.skysql.com
+#      DB_PORT                     = 4048            (SkySQL serverless port, NOT 3306)
+#      DB_NAME                     = <your-database> (no dots allowed in MariaDB db names)
+#      LIQUIBASE_COMMAND_USERNAME  = <db username>            [mark SECRET]
+#      LIQUIBASE_COMMAND_PASSWORD  = <db password>            [mark SECRET]
+#    (SkySQL uses plain username/password auth over TLS — the URL carries
+#     ?sslMode=trust, so no schema token and no cloud-IAM library are needed.)
+#
+# 2) Environment 'mariadb-database' (Pipelines > Environments) with an
+#    Approvals check — this gates the Deploy stage.
+#
+# 3) SkySQL "Allowlist" (IP allowlist) must permit the Microsoft-hosted agent's
+#    egress IP. Hosted agents have dynamic IPs, so either allow the documented
+#    Azure IP ranges, temporarily open 0.0.0.0/0 for a lab, or run on a
+#    self-hosted agent with a stable egress IP and allowlist that.
+#
+# How token substitution works:
+#   liquibase.properties contains simple #{TOKEN}# placeholders for host, port
+#   and database name. An inline sed step replaces them with the variable-group
+#   values at runtime. Credentials are NEVER written to the file — Liquibase
+#   reads LIQUIBASE_COMMAND_USERNAME/PASSWORD natively from the environment,
+#   which we forward into the Docker container with -e flags.
+#
+# JDBC driver: the liquibase/liquibase Docker image does NOT bundle the MariaDB
+# driver ("Cannot find database driver" on a bare run). Drivers are NOT
+# committed to the repo as binaries; instead drivers-pom.xml pins
+# mariadb-java-client, a Maven step resolves it with all transitive
+# dependencies into drivers/, and every docker run mounts that folder at
+# /liquibase/lib.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - changelog/**
+      - rootChangeLog.xml
+      - liquibase.properties
+
+variables:
+  - group: liquibase-mariadb
+  - name: liquibaseImage
+    value: 'liquibase/liquibase:5.0'   # pin to the major verified locally (5.0.3)
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Validate the changelogs and publish a SQL preview artifact.
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Validate changelogs & preview SQL'
+    jobs:
+      - job: Validate
+        displayName: 'Liquibase validate / status / update-sql'
+        steps:
+          - checkout: self
+
+          - bash: |
+              set -euo pipefail
+              sed -i \
+                -e "s|#{DB_HOST}#|$(DB_HOST)|g" \
+                -e "s|#{DB_PORT}#|$(DB_PORT)|g" \
+                -e "s|#{DB_NAME}#|$(DB_NAME)|g" \
+                liquibase.properties
+              if grep -Eq '#\{[A-Z_]+\}#' liquibase.properties; then
+                echo "##[error]Unreplaced tokens remain in liquibase.properties"
+                grep -E '#\{[A-Z_]+\}#' liquibase.properties
+                exit 1
+              fi
+              echo "Token substitution complete."
+            displayName: 'Substitute tokens in liquibase.properties'
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - bash: |
+              set -euo pipefail
+              mvn -B -q -f drivers-pom.xml dependency:copy-dependencies \
+                -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
+                -DincludeScope=runtime
+              echo "Resolved driver jars:"
+              ls -l "$(Build.SourcesDirectory)/drivers"
+            displayName: 'Resolve MariaDB JDBC driver'
+            workingDirectory: $(Build.SourcesDirectory)
+
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                -w /liquibase/changelog \
+                -e LIQUIBASE_COMMAND_USERNAME \
+                -e LIQUIBASE_COMMAND_PASSWORD \
+                $(liquibaseImage) \
+                --defaults-file=/liquibase/changelog/liquibase.properties \
+                validate
+            displayName: 'liquibase validate'
+            env:
+              LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+              LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                -w /liquibase/changelog \
+                -e LIQUIBASE_COMMAND_USERNAME \
+                -e LIQUIBASE_COMMAND_PASSWORD \
+                $(liquibaseImage) \
+                --defaults-file=/liquibase/changelog/liquibase.properties \
+                status --verbose
+            displayName: 'liquibase status (pending changesets)'
+            env:
+              LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+              LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                -w /liquibase/changelog \
+                -e LIQUIBASE_COMMAND_USERNAME \
+                -e LIQUIBASE_COMMAND_PASSWORD \
+                $(liquibaseImage) \
+                --defaults-file=/liquibase/changelog/liquibase.properties \
+                update-sql | tee "$(Build.ArtifactStagingDirectory)/update-preview.sql"
+            displayName: 'liquibase update-sql (preview)'
+            env:
+              LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+              LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+          - publish: $(Build.ArtifactStagingDirectory)/update-preview.sql
+            artifact: sql-preview
+            displayName: 'Publish SQL preview artifact'
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Deploy — gated by the approval check on the ADO Environment.
+  # ---------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy to MariaDB Cloud'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - deployment: DeployDbChanges
+        displayName: 'Liquibase update'
+        environment: mariadb-database   # approval gate configured on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Deployment jobs do not checkout sources by default.
+                - checkout: self
+
+                # Fresh workspace per job — substitute tokens again.
+                - bash: |
+                    set -euo pipefail
+                    sed -i \
+                      -e "s|#{DB_HOST}#|$(DB_HOST)|g" \
+                      -e "s|#{DB_PORT}#|$(DB_PORT)|g" \
+                      -e "s|#{DB_NAME}#|$(DB_NAME)|g" \
+                      liquibase.properties
+                    if grep -Eq '#\{[A-Z_]+\}#' liquibase.properties; then
+                      echo "##[error]Unreplaced tokens remain in liquibase.properties"
+                      exit 1
+                    fi
+                  displayName: 'Substitute tokens in liquibase.properties'
+                  workingDirectory: $(Build.SourcesDirectory)
+
+                - bash: |
+                    set -euo pipefail
+                    mvn -B -q -f drivers-pom.xml dependency:copy-dependencies \
+                      -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
+                      -DincludeScope=runtime
+                  displayName: 'Resolve MariaDB JDBC driver'
+                  workingDirectory: $(Build.SourcesDirectory)
+
+                - bash: |
+                    set -euo pipefail
+                    docker run --rm \
+                      -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                      -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                      -w /liquibase/changelog \
+                      -e LIQUIBASE_COMMAND_USERNAME \
+                      -e LIQUIBASE_COMMAND_PASSWORD \
+                      $(liquibaseImage) \
+                      --defaults-file=/liquibase/changelog/liquibase.properties \
+                      update
+                  displayName: 'liquibase update (deploy changes)'
+                  env:
+                    LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+                    LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)

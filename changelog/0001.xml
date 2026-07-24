@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+  xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                      http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+  <changeSet id="1" author="VivekRamanavar">
+    <comment>Employee: core employee master table.</comment>
+    <sql>
+      <![CDATA[
+      CREATE TABLE `Employee` (
+          `EmpId`    INT           NOT NULL AUTO_INCREMENT,
+          `EmpName`  VARCHAR(128)  NOT NULL,
+          `Email`    VARCHAR(256)  NULL,
+          `HireDate` DATE          NOT NULL,
+          `Salary`   DECIMAL(12,2) NULL,
+          CONSTRAINT `PK_Employee` PRIMARY KEY (`EmpId`)
+      );
+      ]]>
+    </sql>
+    <rollback>DROP TABLE `Employee`</rollback>
+  </changeSet>
+</databaseChangeLog>
