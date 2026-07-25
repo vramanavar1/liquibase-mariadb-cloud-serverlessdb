@@ -47,7 +47,7 @@ These must be completed in order for the pipeline to execute successfully and de
 
 9. **Create the pipeline** — Pipelines → **New pipeline** → select this repo → **Existing Azure Pipelines YAML file** → branch `main`, path `/azure-pipelines.yml` → Save (or Run).
 10. **Authorize resources on first run** — the first run pauses with "This pipeline needs permission to access a resource"; click **Permit** for both the variable group and the environment.
-11. **Follow the run** — Validate stage runs `validate`/`status` and publishes the `sql-preview` artifact; review it, then approve the pending Deploy approval; Deploy stage runs `liquibase update`.
+11. **Follow the run** — Validate stage runs `validate`/`status` and publishes the `sql-preview` artifact; review it, then approve the pending Deploy approval; Deploy stage runs `liquibase update` and then tags the deployment with the version from `metadata.xml`.
 
 ### D. Post-deployment sanity check
 
@@ -56,6 +56,12 @@ These must be completed in order for the pipeline to execute successfully and de
     ```sql
     SELECT ID, AUTHOR, FILENAME, DATEEXECUTED FROM DATABASECHANGELOG ORDER BY ORDEREXECUTED;
     SHOW TABLES;
+    ```
+
+13. Confirm the **version tag** from [metadata.xml](metadata.xml) was applied to the latest changelog row (`TAG` column) — this is what `liquibase rollback <version>` targets:
+
+    ```sql
+    SELECT ID, AUTHOR, DATEEXECUTED, TAG FROM DATABASECHANGELOG WHERE TAG IS NOT NULL ORDER BY ORDEREXECUTED;
     ```
 
 ## Changes
@@ -67,10 +73,11 @@ These must be completed in order for the pipeline to execute successfully and de
 
 **[azure-pipelines.yml](azure-pipelines.yml)** — new two-stage pipeline:
 - **Validate stage**: checks out sources, substitutes tokens via inline `sed` (with a guard that fails the build if any `#{TOKEN}#` remains), then runs `liquibase validate`, `status --verbose`, and `update-sql`, publishing the generated SQL as a `sql-preview` artifact you can inspect before approving.
-- **Deploy stage**: a `deployment` job bound to the `mariadb-database` ADO Environment (add an Approvals check there to gate it), which re-substitutes tokens and runs `liquibase update`.
+- **Deploy stage**: a `deployment` job bound to the `mariadb-database` ADO Environment (add an Approvals check there to gate it), which re-substitutes tokens, runs `liquibase update`, and then stamps the deployed state with a **version tag** (see below).
+- **Version tagging**: after `liquibase update` succeeds, the Deploy stage parses the logical version from [metadata.xml](metadata.xml)'s comment (`{ ... "Version": "x.y.z" }`) and runs `liquibase tag --tag=<version>`, writing that tag against the latest `DATABASECHANGELOG` row. This makes each release addressable for `liquibase rollback <version>`. Re-running with the same version is idempotent — Liquibase re-points the tag to the current last row. Bump the `Version` in [metadata.xml](metadata.xml) to trigger a re-run and stamp a new tag.
 - Liquibase runs via the pinned `liquibase/liquibase:5.0` Docker image (matching the locally-verified 5.0.3); `-w /liquibase/changelog` makes the relative `changeLogFile`/`changelog/` includes resolve correctly.
 - Secrets `LIQUIBASE_COMMAND_USERNAME`/`LIQUIBASE_COMMAND_PASSWORD` are mapped per-step via `env:` (ADO never auto-exports secrets) and forwarded into the container with `-e` flags — credentials never touch the properties file or disk.
-- Triggers on `main` for changes to `changelog/**`, `rootChangeLog.xml`, or `liquibase.properties`.
+- Triggers on `main` for changes to `changelog/**`, `rootChangeLog.xml`, `liquibase.properties`, or `metadata.xml`.
 
 **[pom.xml](pom.xml)** — pinned manifest for the MariaDB JDBC driver, resolved at pipeline runtime and mounted into the Liquibase container (see the dedicated [driver management section](#jdbc-driver-management--pomxml-and-how-its-wired-into-the-pipeline) below).
 
@@ -79,6 +86,8 @@ These must be completed in order for the pipeline to execute successfully and de
 - `0002.xml` — `Department` table + `DepartmentId` foreign key on `Employee`.
 - `0003.xml` — seed data (5 departments, 10 employees — **fictional sample data**).
 - `0004.xml` — `usp_GetEmployee` stored procedure (`runOnChange="true"`).
+
+**[metadata.xml](metadata.xml)** — a metadata-only changelog (included last by [rootChangeLog.xml](rootChangeLog.xml)) whose comment records the logical database version as `{ "Database": "...", "Version": "x.y.z" }`. The Deploy stage parses this `Version` and applies it as a Liquibase tag after each successful `update`, so releases are addressable for rollback. Bump the `Version` here to publish a new tagged release.
 
 ## How the connection to MariaDB Cloud works — why no service connection is needed
 

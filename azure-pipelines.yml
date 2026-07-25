@@ -34,6 +34,12 @@
 # mariadb-java-client, a Maven step resolves it with all transitive
 # dependencies into drivers/, and every docker run mounts that folder at
 # /liquibase/lib.
+#
+# Version tagging: after a successful 'liquibase update' the Deploy stage reads
+# the logical version from metadata.xml's comment ({ ... "Version": "x.y.z" })
+# and applies it as a Liquibase tag, making each release addressable for
+# 'liquibase rollback <version>'. Bump the Version in metadata.xml to trigger a
+# re-run and stamp a new tag.
 # =============================================================================
 
 trigger:
@@ -45,6 +51,7 @@ trigger:
       - changelog/**
       - rootChangeLog.xml
       - liquibase.properties
+      - metadata.xml
 
 variables:
   - group: liquibase-mariadb
@@ -197,6 +204,35 @@ stages:
                       --defaults-file=/liquibase/changelog/liquibase.properties \
                       update
                   displayName: 'liquibase update (deploy changes)'
+                  env:
+                    LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+                    LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+                # Stamp the just-deployed state with the logical version from
+                # metadata.xml's comment ({ ... "Version": "x.y.z" }). The tag
+                # is written against the last DATABASECHANGELOG row, so the
+                # release becomes addressable for `liquibase rollback <version>`.
+                # Re-running with the same version is idempotent (Liquibase
+                # re-points the tag to the current last row).
+                - bash: |
+                    set -euo pipefail
+                    DB_VERSION=$(sed -n 's/.*"Version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' metadata.xml | head -n1)
+                    if [ -z "$DB_VERSION" ]; then
+                      echo "##[error]Could not parse \"Version\" from metadata.xml"
+                      exit 1
+                    fi
+                    echo "Tagging deployed database state with version: $DB_VERSION"
+                    docker run --rm \
+                      -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                      -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                      -w /liquibase/changelog \
+                      -e LIQUIBASE_COMMAND_USERNAME \
+                      -e LIQUIBASE_COMMAND_PASSWORD \
+                      $(liquibaseImage) \
+                      --defaults-file=/liquibase/changelog/liquibase.properties \
+                      tag --tag="$DB_VERSION"
+                  displayName: 'liquibase tag (version from metadata.xml)'
+                  workingDirectory: $(Build.SourcesDirectory)
                   env:
                     LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
                     LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
