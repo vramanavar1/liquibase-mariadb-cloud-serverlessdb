@@ -30,7 +30,7 @@
 #
 # JDBC driver: the liquibase/liquibase Docker image does NOT bundle the MariaDB
 # driver ("Cannot find database driver" on a bare run). Drivers are NOT
-# committed to the repo as binaries; instead drivers-pom.xml pins
+# committed to the repo as binaries; instead pom.xml pins
 # mariadb-java-client, a Maven step resolves it with all transitive
 # dependencies into drivers/, and every docker run mounts that folder at
 # /liquibase/lib.
@@ -84,7 +84,7 @@ stages:
 
           - bash: |
               set -euo pipefail
-              mvn -B -q -f drivers-pom.xml dependency:copy-dependencies \
+              mvn -B -q dependency:copy-dependencies \
                 -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
                 -DincludeScope=runtime
               echo "Resolved driver jars:"
@@ -179,7 +179,7 @@ stages:
 
                 - bash: |
                     set -euo pipefail
-                    mvn -B -q -f drivers-pom.xml dependency:copy-dependencies \
+                    mvn -B -q dependency:copy-dependencies \
                       -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
                       -DincludeScope=runtime
                   displayName: 'Resolve MariaDB JDBC driver'

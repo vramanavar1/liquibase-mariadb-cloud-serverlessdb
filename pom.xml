@@ -7,7 +7,7 @@
   run). Instead of committing jar binaries to the repo, the pipeline resolves
   the driver from Maven Central at runtime:
 
-      mvn -B -f drivers-pom.xml dependency:copy-dependencies \
+      mvn -B dependency:copy-dependencies \
           -DoutputDirectory=drivers -DincludeScope=runtime
 
   and mounts the resulting drivers/ folder into the container at

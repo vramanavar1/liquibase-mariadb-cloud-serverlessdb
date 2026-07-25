@@ -1,4 +1,4 @@
-# Resolved at pipeline runtime from drivers-pom.xml — never commit jar binaries
+# Resolved at pipeline runtime from pom.xml — never commit jar binaries
 drivers/
 
 # Local logs / scratch output

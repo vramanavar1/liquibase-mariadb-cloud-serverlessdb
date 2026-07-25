@@ -72,7 +72,7 @@ These must be completed in order for the pipeline to execute successfully and de
 - Secrets `LIQUIBASE_COMMAND_USERNAME`/`LIQUIBASE_COMMAND_PASSWORD` are mapped per-step via `env:` (ADO never auto-exports secrets) and forwarded into the container with `-e` flags — credentials never touch the properties file or disk.
 - Triggers on `main` for changes to `changelog/**`, `rootChangeLog.xml`, or `liquibase.properties`.
 
-**[drivers-pom.xml](drivers-pom.xml)** — pinned manifest for the MariaDB JDBC driver, resolved at pipeline runtime and mounted into the Liquibase container (see the dedicated [driver management section](#jdbc-driver-management--drivers-pomxml-and-how-its-wired-into-the-pipeline) below).
+**[pom.xml](pom.xml)** — pinned manifest for the MariaDB JDBC driver, resolved at pipeline runtime and mounted into the Liquibase container (see the dedicated [driver management section](#jdbc-driver-management--pomxml-and-how-its-wired-into-the-pipeline) below).
 
 **[changelog/](changelog/)** — ordered changesets, included by [rootChangeLog.xml](rootChangeLog.xml) (uncomment each `<include>` when ready to deploy it):
 - `0001.xml` — `Employee` table.
@@ -109,7 +109,7 @@ Variable group (secrets)
 - Linking the variable group to **Azure Key Vault** (recommended hardening — secrets live in Key Vault, ADO fetches them through a service connection).
 - Any pipeline step that manages cloud resources (provisioning the SkySQL service, editing allowlists via API, etc.).
 
-## JDBC driver management — drivers-pom.xml and how it's wired into the pipeline
+## JDBC driver management — pom.xml and how it's wired into the pipeline
 
 ### The problem it solves
 
@@ -121,9 +121,9 @@ Unexpected error running Liquibase: Cannot find database driver: org.mariadb.jdb
 
 Committing the driver `.jar` to the repo was rejected deliberately: binaries bloat git history and can't be code-reviewed.
 
-### What drivers-pom.xml is
+### What pom.xml is
 
-[drivers-pom.xml](drivers-pom.xml) is a **text manifest, not an application build** — a minimal `pom`-packaging Maven file that pins exactly one coordinate:
+[pom.xml](pom.xml) is a **text manifest, not an application build** — a minimal `pom`-packaging Maven file that pins exactly one coordinate:
 
 | Artifact | Version | Why |
 |---|---|---|
@@ -134,7 +134,7 @@ SkySQL's plain username/password auth needs no companion library, so — unlike 
 ### How it's wired into the pipeline
 
 ```
-drivers-pom.xml (checked in, text)
+pom.xml (checked in, text)
       │
       │  1. mvn dependency:copy-dependencies        (pipeline step, both jobs;
       ▼     -DoutputDirectory=drivers                Maven pre-installed on agents)
@@ -149,7 +149,7 @@ drivers/ on the agent  (git-ignored)
 1. **Resolve** — the step *"Resolve MariaDB JDBC driver"* in [azure-pipelines.yml](azure-pipelines.yml) runs:
 
    ```bash
-   mvn -B -q -f drivers-pom.xml dependency:copy-dependencies \
+   mvn -B -q dependency:copy-dependencies \
      -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
      -DincludeScope=runtime
    ```
@@ -166,7 +166,7 @@ drivers/ on the agent  (git-ignored)
 
 The `drivers/` output folder is excluded via [.gitignore](.gitignore) — jars exist only on the agent for the lifetime of a run.
 
-**To upgrade the driver**: bump the version in `drivers-pom.xml`. Nothing else changes.
+**To upgrade the driver**: bump the version in `pom.xml`. Nothing else changes.
 
 ## Security best practices not applied here
 
@@ -191,12 +191,12 @@ The `drivers/` output folder is excluded via [.gitignore](.gitignore) — jars e
   - A wide SkySQL allowlist (or `0.0.0.0/0`) admits traffic from anywhere. Production: **self-hosted agents** with a stable, allowlisted egress IP, or SkySQL private connectivity where available.
 - **Supply chain**
   - Pin the Docker image **by digest** (`liquibase/liquibase@sha256:…`) rather than a mutable tag.
-  - Route Maven resolution through an **Azure Artifacts upstream feed** (proxy/quarantine of Maven Central) and add dependency/vulnerability scanning of `drivers-pom.xml`.
+  - Route Maven resolution through an **Azure Artifacts upstream feed** (proxy/quarantine of Maven Central) and add dependency/vulnerability scanning of `pom.xml`.
 - **Audit**
   - Enable **Azure DevOps audit log streaming** to a SIEM (who approved, who changed variable groups, who edited the pipeline).
 
 ## Verification Process
 
 - `sed` substitution smoke-tested against a copy of the tokenized properties: reproduces the intended working URL **byte-for-byte**, and the guard (`#\{[A-Z_]+\}#`) correctly detects unreplaced tokens in the raw file and passes on the substituted file.
-- `azure-pipelines.yml` parses cleanly as YAML; all changelog XML and `rootChangeLog.xml`/`drivers-pom.xml` parse cleanly as XML.
+- `azure-pipelines.yml` parses cleanly as YAML; all changelog XML and `rootChangeLog.xml`/`pom.xml` parse cleanly as XML.
 - The pinned Maven artifact (`mariadb-java-client:3.5.9`) confirmed present on Maven Central.
