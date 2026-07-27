@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- =========================================================================
-  Driver manifest for the CI/CD pipeline (NOT an application build).
+  This POM serves two purposes. It is NOT an application build.
 
+  (1) DRIVER MANIFEST for the Azure DevOps pipeline
+  ================================================
   The liquibase/liquibase Docker image does not bundle the MariaDB JDBC
   driver ("Cannot find database driver: org.mariadb.jdbc.Driver" on a bare
   run). Instead of committing jar binaries to the repo, the pipeline resolves
@@ -11,13 +13,33 @@
           -DoutputDirectory=drivers -DincludeScope=runtime
 
   and mounts the resulting drivers/ folder into the container at
-  /liquibase/lib (see azure-pipelines.yml).
+  /liquibase/lib (see azure-pipelines.yml). The project-level
+  <dependencies> block below is what that command walks - keep
+  mariadb-java-client at compile scope or the pipeline breaks.
+
+  (2) LOCAL LIQUIBASE RUNNER + TEST HARNESS  (profile: Test)
+  ==========================================================
+      $env:LIQUIBASE_COMMAND_USERNAME = '<username>'
+      $env:LIQUIBASE_COMMAND_PASSWORD = '<password>'
+      mvn -PTest test
+
+  process-test-resources runs dropAll then update; the `test` phase that
+  follows asserts the seeded row counts via two independent tests -
+  DepartmentCountTest and EmployeeCountTest - so each reports PASSED/FAILED on
+  its own. Nothing in the Test profile is active unless -PTest is passed, so
+  (1) stays untouched.
+
+  NOTE: "Test" is a PROFILE id, not a lifecycle phase. Profile ids are
+  free-form - rename to TestV1/qa/uat and invoke `mvn -PTestV1 test`. Phases
+  are fixed by Maven and cannot be invented. Everything environment-specific
+  lives in the profile's <properties>, so a second environment is a copy of
+  that block with different values.
 
   MariaDB SkySQL uses plain username/password auth over TLS (?sslMode=trust in
   the URL), so no cloud-IAM companion library is required (unlike the Entra
   service-principal variant, which additionally needs msal4j).
 
-  To upgrade the driver: bump the version below. Nothing else to change.
+  To upgrade the driver: bump mariadb.driver.version below. Nothing else.
 ========================================================================== -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -27,14 +49,130 @@
   <groupId>local.pipeline</groupId>
   <artifactId>liquibase-jdbc-drivers</artifactId>
   <version>1.0.0</version>
-  <packaging>pom</packaging>
+  <!-- jar (not pom): Surefire does not run tests under pom packaging. There is
+       no src/main/java, so the produced jar is empty and simply unused. -->
+  <packaging>jar</packaging>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>21</maven.compiler.release>
+
+    <!-- Keep in lockstep with the Docker image pinned in azure-pipelines.yml -->
+    <liquibase.version>5.0.3</liquibase.version>
+    <mariadb.driver.version>3.5.9</mariadb.driver.version>
+    <junit.version>5.11.4</junit.version>
+
+    <!-- Tests hit a live database, so they are OFF by default: a bare
+         `mvn test` / `mvn package` must never touch it. -PTest flips this. -->
+    <skipTests>true</skipTests>
+  </properties>
 
   <dependencies>
-    <!-- MariaDB Connector/J JDBC driver -->
+    <!-- MariaDB Connector/J JDBC driver.
+         Compile scope on purpose: dependency:copy-dependencies -DincludeScope=runtime
+         (the pipeline's driver-resolution step) must see it. -->
     <dependency>
       <groupId>org.mariadb.jdbc</groupId>
       <artifactId>mariadb-java-client</artifactId>
-      <version>3.5.9</version>
+      <version>${mariadb.driver.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <profiles>
+    <profile>
+      <id>Test</id>
+
+      <!-- Everything environment-specific lives here. A TestV2 profile is a
+           copy of this block with different values and the same wiring. -->
+      <properties>
+        <skipTests>false</skipTests>
+        <changelog.file>rootMvnChangeLog.xml</changelog.file>
+        <db.url>jdbc:mariadb://serverless-europe-west3.sysp0000.db2.skysql.com:4048/VSCTestDatabase?sslMode=trust</db.url>
+        <expected.department.count>5</expected.department.count>
+        <expected.employee.count>10</expected.employee.count>
+      </properties>
+
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.liquibase</groupId>
+            <artifactId>liquibase-maven-plugin</artifactId>
+            <version>${liquibase.version}</version>
+
+            <configuration>
+              <!-- No target/classes worth searching, so point the resolver at the
+                   repo root for rootMvnChangeLog.xml and its relative includes. -->
+              <searchPath>${project.basedir}</searchPath>
+              <changeLogFile>${changelog.file}</changeLogFile>
+              <driver>org.mariadb.jdbc.Driver</driver>
+              <url>${db.url}</url>
+              <!-- Credentials never live in this file. Unset env vars come through
+                   as the literal string ${env.X} and fail as "Access denied". -->
+              <username>${env.LIQUIBASE_COMMAND_USERNAME}</username>
+              <password>${env.LIQUIBASE_COMMAND_PASSWORD}</password>
+            </configuration>
+
+            <!-- Plugin-scoped copy of the driver: the plugin runs in its own
+                 classloader and needs it there. This does NOT replace the
+                 project-level dependency, which exists for the pipeline. -->
+            <dependencies>
+              <dependency>
+                <groupId>org.mariadb.jdbc</groupId>
+                <artifactId>mariadb-java-client</artifactId>
+                <version>${mariadb.driver.version}</version>
+              </dependency>
+            </dependencies>
+
+            <!-- Same phase: executions run in declaration order, dropAll before
+                 update. process-test-resources precedes test-compile/test, so
+                 the count tests run against the freshly seeded database. -->
+            <executions>
+              <execution>
+                <id>liquibase-drop-all</id>
+                <phase>process-test-resources</phase>
+                <goals>
+                  <goal>dropAll</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>liquibase-update</id>
+                <phase>process-test-resources</phase>
+                <goals>
+                  <goal>update</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>3.5.2</version>
+            <configuration>
+              <!-- The tests read these; credentials stay in the environment. -->
+              <systemPropertyVariables>
+                <db.url>${db.url}</db.url>
+                <expected.department.count>${expected.department.count}</expected.department.count>
+                <expected.employee.count>${expected.employee.count}</expected.employee.count>
+              </systemPropertyVariables>
+              <!-- Report a failure as a one-line reason, not a Java stack trace.
+                   DbTestSupport already converts every SQL/config problem into an
+                   assertion failure, so output stays PASSED/FAILED + message. -->
+              <trimStackTrace>true</trimStackTrace>
+              <!-- Never stop after the first failing class: DepartmentCountTest and
+                   EmployeeCountTest must always both report their own result. -->
+              <skipAfterFailureCount>0</skipAfterFailureCount>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

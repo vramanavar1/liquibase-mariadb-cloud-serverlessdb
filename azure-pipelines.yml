@@ -2,6 +2,19 @@
 # Azure DevOps CI/CD pipeline: deploy Liquibase changelogs to MariaDB Cloud
 # (SkySQL serverless).
 #
+# Four-stage promotion path:
+#
+#   1 Validate ──▶ 2 Deploy to Test ──▶ 3 UnitTests ──▶ 4 Deploy to Production
+#                  (gate: mariadb-database)             (gate: mariadb-production)
+#
+#   1 Validate   validate / status / update-sql, publishes a SQL preview artifact
+#   2 DeployTest gated `liquibase update` + version tag against the test database
+#   3 UnitTests  `mvn -PTest test` — dropAll + update + JUnit row-count assertions;
+#                failing tests block Stage 4 (see the stage comment for a known gap)
+#   4 DeployProd gated production update + tag + smoke check; ships with STUB
+#                connection values and a guard step that refuses to run until
+#                they are replaced
+#
 # One-time setup required in the Azure DevOps project:
 #
 # 1) Variable group 'liquibase-mariadb' (Pipelines > Library) containing:
@@ -14,7 +27,12 @@
 #     ?sslMode=trust, so no schema token and no cloud-IAM library are needed.)
 #
 # 2) Environment 'mariadb-database' (Pipelines > Environments) with an
-#    Approvals check — this gates the Deploy stage.
+#    Approvals check — this gates Stage 2 (Deploy to Test).
+#
+# 2b) Environment 'mariadb-production' with its own Approvals check — this
+#    gates Stage 4. Create it the same way (resource: None), and add the
+#    approver(s) under 'Approvals and checks'. Without the check the
+#    production stage would run unattended.
 #
 # 3) SkySQL "Allowlist" (IP allowlist) must permit the Microsoft-hosted agent's
 #    egress IP. Hosted agents have dynamic IPs, so either allow the documented
@@ -52,6 +70,12 @@ trigger:
       - rootChangeLog.xml
       - liquibase.properties
       - metadata.xml
+      # Test harness: a change to the tests or their changelog lineage must
+      # re-run the pipeline, otherwise Stage 3 validates a stale commit.
+      - changelog_mvn/**
+      - rootMvnChangeLog.xml
+      - pom.xml
+      - src/**
 
 variables:
   - group: liquibase-mariadb
@@ -152,10 +176,11 @@ stages:
             displayName: 'Publish SQL preview artifact'
 
   # ---------------------------------------------------------------------------
-  # Stage 2: Deploy — gated by the approval check on the ADO Environment.
+  # Stage 2: Deploy to the TEST database — gated by the approval check on the
+  # 'mariadb-database' ADO Environment.
   # ---------------------------------------------------------------------------
-  - stage: Deploy
-    displayName: 'Deploy to MariaDB Cloud'
+  - stage: DeployTest
+    displayName: 'Deploy to Test database'
     dependsOn: Validate
     condition: succeeded()
     jobs:
@@ -236,3 +261,244 @@ stages:
                   env:
                     LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
                     LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Unit tests — the quality gate that guards production.
+  #
+  # Runs Maven natively on the agent rather than through the Liquibase Docker
+  # image: the liquibase-maven-plugin carries its own plugin-scoped copy of the
+  # MariaDB driver (see pom.xml), so there is nothing to resolve or mount here.
+  #
+  # SELF-CONTAINED by design. `mvn -PTest test` binds dropAll + update to
+  # process-test-resources, so this stage DROPS AND REBUILDS the test database
+  # from rootMvnChangeLog.xml before asserting. It does not test what Stage 2
+  # deployed.
+  #
+  # KNOWN GAP: Stage 2 and Stage 4 deploy rootChangeLog.xml, which still has
+  # changesets 0002/0003/0004 commented out — that lineage creates only the
+  # Employee table. Stage 3 tests rootMvnChangeLog.xml, where all four are
+  # active. A green Stage 3 therefore says nothing about the artifact that
+  # reaches production. To close the gap: uncomment those three <include> lines
+  # in rootChangeLog.xml, then add -Dliquibase.skip=true to the mvn call below
+  # so this stage asserts against the real deployment instead of its own.
+  # ---------------------------------------------------------------------------
+  - stage: UnitTests
+    displayName: 'Unit tests (mvn -PTest)'
+    dependsOn: DeployTest
+    condition: succeeded()
+    jobs:
+      - job: RunUnitTests
+        displayName: 'dropAll + update + assert seeded row counts'
+        steps:
+          - checkout: self
+
+          # pom.xml sets maven.compiler.release=21, so pin the JDK explicitly
+          # rather than inheriting whatever the image default happens to be.
+          - task: JavaToolInstaller@0
+            displayName: 'Use JDK 21'
+            inputs:
+              versionSpec: '21'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          # -Ddb.url overrides the developer URL baked into the Test profile in
+          # pom.xml (CLI -D beats a profile <properties> value), so CI always
+          # targets the variable-group database. Without it this would silently
+          # run against whichever host the pom happens to name.
+          # `clean` matters on SELF-HOSTED agents, which reuse the workspace:
+          # without it, surefire XML from a previous run (including reports for
+          # deleted test classes) would be republished as if it were current.
+          - bash: |
+              set -euo pipefail
+              mvn -B -PTest clean test \
+                -Ddb.url="jdbc:mariadb://$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslMode=trust"
+            displayName: 'mvn -PTest clean test'
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              LIQUIBASE_COMMAND_USERNAME: $(LIQUIBASE_COMMAND_USERNAME)
+              LIQUIBASE_COMMAND_PASSWORD: $(LIQUIBASE_COMMAND_PASSWORD)
+
+          # condition: always() — results must publish even when tests fail,
+          # which is precisely the run worth inspecting.
+          # failTaskOnFailedTests: false — Surefire already failed the step
+          # above; this avoids a second, less informative error.
+          - task: PublishTestResults@2
+            displayName: 'Publish JUnit results'
+            condition: always()
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+              testRunTitle: 'Liquibase seed-data checks'
+              failTaskOnFailedTests: false
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: Production deployment — gated by the approval check on the
+  # 'mariadb-production' ADO Environment, and reachable only when Stage 3 is
+  # green (dependsOn + condition: succeeded()).
+  #
+  # Mirrors Stage 2 step for step — substitute tokens, resolve the JDBC driver,
+  # liquibase update, stamp the version tag from metadata.xml — and adds a
+  # post-deploy status smoke check.
+  # ---------------------------------------------------------------------------
+  - stage: DeployProd
+    displayName: 'Deploy to Production (gated)'
+    dependsOn: UnitTests
+    condition: succeeded()
+
+    # =========================================================================
+    # STUB VALUES — replace before the first production run.
+    #
+    # These are placeholders so the stage is readable and syntactically
+    # complete. The guard step below refuses to run while any REPLACE-ME
+    # remains, so committing them cannot cause an accidental deployment.
+    #
+    # RECOMMENDED for real use: delete this whole block and reference a secret
+    # store instead —
+    #     variables:
+    #       - group: liquibase-mariadb-prod
+    # with DB_HOST / DB_PORT / DB_NAME / LIQUIBASE_COMMAND_USERNAME /
+    # LIQUIBASE_COMMAND_PASSWORD (the last two marked secret). A separate group
+    # keeps prod credentials out of source control and means a leaked test
+    # credential cannot reach production.
+    # =========================================================================
+    variables:
+      - name: PROD_DB_HOST
+        value: 'REPLACE-ME-prod.db2.skysql.com'
+      - name: PROD_DB_PORT
+        value: '4048'
+      - name: PROD_DB_NAME
+        value: 'REPLACE_ME_ProdDatabase'
+      - name: PROD_LIQUIBASE_COMMAND_USERNAME
+        value: 'REPLACE-ME-prod-user'
+      - name: PROD_LIQUIBASE_COMMAND_PASSWORD
+        value: 'REPLACE-ME-prod-password'
+
+    jobs:
+      - deployment: DeployProdDbChanges
+        displayName: 'Liquibase update (production)'
+        environment: mariadb-production   # approval gate configured on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Deployment jobs do not checkout sources by default.
+                - checkout: self
+
+                # Fail fast while the stubs above are unreplaced. This is what
+                # makes committing placeholder values safe.
+                - bash: |
+                    set -euo pipefail
+                    STUBS="$(PROD_DB_HOST)$(PROD_DB_NAME)$(PROD_LIQUIBASE_COMMAND_USERNAME)$(PROD_LIQUIBASE_COMMAND_PASSWORD)"
+                    if printf '%s' "$STUBS" | grep -q 'REPLACE-ME\|REPLACE_ME'; then
+                      echo "##[error]Stage 4 still holds stub values."
+                      echo "##[error]Replace the PROD_* variables in azure-pipelines.yml, or"
+                      echo "##[error]swap them for the 'liquibase-mariadb-prod' variable group."
+                      exit 1
+                    fi
+                    echo "Production connection details supplied."
+                  displayName: 'Guard: reject unreplaced stub values'
+
+                # Fresh workspace per job, so liquibase.properties still carries
+                # its #{TOKEN}# markers — substitute them with PROD values.
+                - bash: |
+                    set -euo pipefail
+                    sed -i \
+                      -e "s|#{DB_HOST}#|$(PROD_DB_HOST)|g" \
+                      -e "s|#{DB_PORT}#|$(PROD_DB_PORT)|g" \
+                      -e "s|#{DB_NAME}#|$(PROD_DB_NAME)|g" \
+                      liquibase.properties
+                    if grep -Eq '#\{[A-Z_]+\}#' liquibase.properties; then
+                      echo "##[error]Unreplaced tokens remain in liquibase.properties"
+                      grep -E '#\{[A-Z_]+\}#' liquibase.properties
+                      exit 1
+                    fi
+                    echo "Token substitution complete (production)."
+                  displayName: 'Substitute tokens in liquibase.properties'
+                  workingDirectory: $(Build.SourcesDirectory)
+
+                - bash: |
+                    set -euo pipefail
+                    mvn -B -q dependency:copy-dependencies \
+                      -DoutputDirectory="$(Build.SourcesDirectory)/drivers" \
+                      -DincludeScope=runtime
+                  displayName: 'Resolve MariaDB JDBC driver'
+                  workingDirectory: $(Build.SourcesDirectory)
+
+                - bash: |
+                    set -euo pipefail
+                    docker run --rm \
+                      -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                      -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                      -w /liquibase/changelog \
+                      -e LIQUIBASE_COMMAND_USERNAME \
+                      -e LIQUIBASE_COMMAND_PASSWORD \
+                      $(liquibaseImage) \
+                      --defaults-file=/liquibase/changelog/liquibase.properties \
+                      update
+                  displayName: 'liquibase update (production)'
+                  env:
+                    LIQUIBASE_COMMAND_USERNAME: $(PROD_LIQUIBASE_COMMAND_USERNAME)
+                    LIQUIBASE_COMMAND_PASSWORD: $(PROD_LIQUIBASE_COMMAND_PASSWORD)
+
+                # Same version-tagging contract as Stage 2: parse the logical
+                # version from metadata.xml and make the release addressable
+                # for `liquibase rollback <version>`.
+                - bash: |
+                    set -euo pipefail
+                    DB_VERSION=$(sed -n 's/.*"Version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' metadata.xml | head -n1)
+                    if [ -z "$DB_VERSION" ]; then
+                      echo "##[error]Could not parse \"Version\" from metadata.xml"
+                      exit 1
+                    fi
+                    echo "Tagging production database state with version: $DB_VERSION"
+                    docker run --rm \
+                      -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                      -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                      -w /liquibase/changelog \
+                      -e LIQUIBASE_COMMAND_USERNAME \
+                      -e LIQUIBASE_COMMAND_PASSWORD \
+                      $(liquibaseImage) \
+                      --defaults-file=/liquibase/changelog/liquibase.properties \
+                      tag --tag="$DB_VERSION"
+                  displayName: 'liquibase tag (version from metadata.xml)'
+                  workingDirectory: $(Build.SourcesDirectory)
+                  env:
+                    LIQUIBASE_COMMAND_USERNAME: $(PROD_LIQUIBASE_COMMAND_USERNAME)
+                    LIQUIBASE_COMMAND_PASSWORD: $(PROD_LIQUIBASE_COMMAND_PASSWORD)
+
+                # Smoke check: a successful `update` must leave nothing pending.
+                #
+                # Three-way on purpose, and it fails safe. The two patterns are
+                # Liquibase 5.0.3's verified wording:
+                #   pending -> "2 changesets have not been applied to <user>@<url>"
+                #   clean   -> "<user>@<url> is up to date"
+                # Anything else means the wording changed or the command
+                # misbehaved, and a production gate must not read "unrecognised"
+                # as "healthy" — so that path fails too, printing the raw output.
+                - bash: |
+                    set -euo pipefail
+                    STATUS=$(docker run --rm \
+                      -v "$(Build.SourcesDirectory):/liquibase/changelog" \
+                      -v "$(Build.SourcesDirectory)/drivers:/liquibase/lib" \
+                      -w /liquibase/changelog \
+                      -e LIQUIBASE_COMMAND_USERNAME \
+                      -e LIQUIBASE_COMMAND_PASSWORD \
+                      $(liquibaseImage) \
+                      --defaults-file=/liquibase/changelog/liquibase.properties \
+                      status --verbose 2>&1)
+                    echo "$STATUS"
+                    if printf '%s' "$STATUS" | grep -Eq '[1-9][0-9]* changeset(s)? ha(s|ve) not been applied'; then
+                      echo "##[error]Pending changesets remain after update - deployment incomplete"
+                      exit 1
+                    elif printf '%s' "$STATUS" | grep -q 'is up to date'; then
+                      echo "Smoke check passed: database is up to date, no pending changesets."
+                    else
+                      echo "##[error]Could not confirm deployment state from 'liquibase status' output above."
+                      echo "##[error]Treating an unrecognised result as a failure."
+                      exit 1
+                    fi
+                  displayName: 'Smoke check: no pending changesets'
+                  workingDirectory: $(Build.SourcesDirectory)
+                  env:
+                    LIQUIBASE_COMMAND_USERNAME: $(PROD_LIQUIBASE_COMMAND_USERNAME)
+                    LIQUIBASE_COMMAND_PASSWORD: $(PROD_LIQUIBASE_COMMAND_PASSWORD)

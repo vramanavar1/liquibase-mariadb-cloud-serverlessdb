@@ -1,5 +1,86 @@
-# Resolved at pipeline runtime from pom.xml — never commit jar binaries
+# =============================================================================
+# Liquibase -> MariaDB Cloud (SkySQL serverless)
+#
+# What IS committed: the changelogs, rootChangeLog.xml / rootMvnChangeLog.xml,
+# metadata.xml, the TOKENIZED liquibase.properties, pom.xml, azure-pipelines.yml
+# and the test sources under src/test. Everything below is generated at build
+# time, machine-local, or a secret - none of it belongs in git.
+# =============================================================================
+
+# --- Build output -----------------------------------------------------------
+# Resolved at pipeline runtime from pom.xml - never commit jar binaries.
+# (azure-pipelines.yml: mvn dependency:copy-dependencies -DoutputDirectory=drivers)
 drivers/
 
-# Local logs / scratch output
+# Maven output, including target/surefire-reports from `mvn -PTest test`.
+target/
+
+# Maven housekeeping files
+dependency-reduced-pom.xml
+.flattened-pom.xml
+pom.xml.versionsBackup
+pom.xml.releaseBackup
+release.properties
+buildNumber.properties
+.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+
+# --- Secrets and credential material ----------------------------------------
+# Credentials reach Liquibase through LIQUIBASE_COMMAND_USERNAME / _PASSWORD,
+# supplied by the Azure DevOps variable group or by the local shell. Nothing
+# below should ever be committed - if one of these files is added by mistake,
+# rotate the secret rather than just deleting the file.
+.env
+.env.*
+!.env.example
+*.pem
+*.crt
+*.cer
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.truststore
+
+# Local, de-tokenized copies of liquibase.properties. The committed file keeps
+# its #{DB_HOST}# markers; a working copy with real values must stay local.
+liquibase.local.properties
+liquibase-local.properties
+*.local.properties
+
+# Liquibase local settings that can embed connection details
+liquibase.checks-settings.conf
+
+# --- Generated SQL previews -------------------------------------------------
+# Output of `liquibase update-sql` / `liquibase:updateSQL`. Note this does NOT
+# ignore *.sql wholesale, so SQL-format changelogs can be added later.
+update-preview.sql
+*-preview.sql
+*.updateSQL.sql
+
+# --- Local logs / scratch output --------------------------------------------
 *.log
+errorlog.txt
+*.tmp
+*.bak
+~$*
+
+# --- IDE / editor -----------------------------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+.factorypath
+nbproject/private/
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
